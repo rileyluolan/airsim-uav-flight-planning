@@ -15,8 +15,6 @@ class TrackingOptions:
     clearance: float = 0.55
     reference_clearance: float | None = None
     initial_clearance: float | None = None
-    acceleration_reserve: float = 0.04
-    speed_reserve: float = 0.06
     kp: float = 2.0
     kd: float = 2.0
 
@@ -31,10 +29,6 @@ class TrackingOptions:
         if self.initial_clearance is not None and (not np.isfinite(self.initial_clearance)
                 or not 0 <= self.initial_clearance <= self.clearance):
             raise ValueError("当前状态安全间距无效。")
-        if not np.isfinite([self.acceleration_reserve, self.speed_reserve]).all() \
-                or not 0 <= self.acceleration_reserve < self.max_acceleration \
-                or not 0 <= self.speed_reserve < self.max_speed:
-            raise ValueError("控制运动余量无效。")
 
 
 class JerkTracker:
@@ -65,9 +59,9 @@ class JerkTracker:
             constraints += [pn == p + h * v + h * h * a / 2 + h ** 3 * j / 6,
                             vn == v + h * a + h * h * j / 2, an == a + h * j,
                             cp.norm(j) <= self.options.max_jerk,
-                            cp.norm(an) <= self.options.max_acceleration - self.options.acceleration_reserve,
-                            cp.norm(vn) <= self.options.max_speed - self.options.speed_reserve,
-                            cp.norm(v + h * a / 2) <= self.options.max_speed - self.options.speed_reserve]
+                            cp.norm(an) <= self.options.max_acceleration,
+                            cp.norm(vn) <= self.options.max_speed,
+                            cp.norm(v + h * a / 2) <= self.options.max_speed]
             for normals, offsets in zip(self.normals, self.offsets):
                 # 三次位置曲线的 Bernstein 控制点全部位于障碍外部半平面。
                 for control in (p, p + h * v / 3, p + 2 * h * v / 3 + h * h * a / 6, pn):

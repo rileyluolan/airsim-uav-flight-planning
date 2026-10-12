@@ -1,6 +1,6 @@
 # joint_time 轨迹生成与 MPC 循迹控制
 
-2026-10-12，Asia/Shanghai。对应当前七航点场景。飞行入口直接读取规划保存的分段时间。
+2026-10-12，Asia/Shanghai。对应当前七航点场景。飞行入口通过 `--scale` 设置参考时间倍率，默认值为 1.8。
 
 ## 从任务点生成轨迹
 
@@ -24,7 +24,7 @@
 
 本次 AirSim 飞行入口为 `code/evaluation/airsim_limited_flight.py --method joint_time`。`code/main.py` 提供地面站和地图绘制组件；本次受限飞行通过专用入口运行。
 
-`Reference` 读取保存的 Bernstein 控制点和时间，使用 SciPy `BPoly` 计算参考位置、速度和加速度。默认参考时间与规划保存的分段时间一致，飞行入口直接调用 `Reference(data)`。
+`Reference` 读取保存的 Bernstein 控制点和时间，使用 SciPy `BPoly` 计算参考位置、速度和加速度。飞行入口调用 `Reference(data, scale=args.scale)`，默认将全部分段时间乘以 1.8，保持空间曲线与任务点位置。
 
 `JerkTracker("mpc", ...)` 每 0.05 秒预测未来 25 个控制周期，预测范围为 1.25 秒。状态由实测位置、实测速度和加速度指令组成，优化输入为 jerk。
 
@@ -44,13 +44,10 @@ $$v_{k+1}=v_k+h a_k+\tfrac12 h^2 j_k,\qquad a_{k+1}=a_k+h j_k$$
 
 | 参数 | 当前实验值 |
 |---|---:|
-| 实际采样速度上限 | 2 m/s |
-| 实际采样加速度上限 | 1 m/s² |
-| 实际采样 jerk 上限 | 4 m/s³ |
-| MPC 模型速度上限 | 1.85 m/s |
-| MPC 模型加速度上限 | 0.7 m/s² |
-| MPC jerk 指令上限 | 0.8 m/s³ |
-| 飞行参考时间 | 规划保存的原始分段时间 |
+| 规划、MPC 与实际采样速度上限 | 2 m/s |
+| 规划、MPC 与实际采样加速度上限 | 1 m/s² |
+| 规划、MPC 与实际采样 jerk 上限 | 4 m/s³ |
+| 参考时间倍率 | 1.8 |
 | 控制周期 | 0.05 秒 |
 | 预测周期数量 | 25 |
 | 参考轨迹安全间距 | 0.8 米 |
@@ -58,7 +55,7 @@ $$v_{k+1}=v_k+h a_k+\tfrac12 h^2 j_k,\qquad a_{k+1}=a_k+h j_k$$
 | 请求的物理推进间隔 | 0.01 秒 |
 | 录像采样间隔 | 0.05 秒 |
 
-这些数值来自飞行入口的具体配置。`TrackingOptions` 的通用默认值保留在控制模块中。
+飞行入口从 `scenario.json` 的 `limits` 读取三项运动上限，直接用于 MPC 和实际遥测审核。`TrackingOptions` 的三项运动约束直接使用对应上限。
 
 速度、加速度和 jerk 都按三维 Euclidean 范数审核。实际 jerk 由相邻加速度差除以实际 AirSim 时间间隔计算。飞行脚本逐个采样检查运动限制、至少 0.8 米障碍间距及场景碰撞。
 
@@ -74,27 +71,27 @@ $$v_{k+1}=v_k+h a_k+\tfrac12 h^2 j_k,\qquad a_{k+1}=a_k+h j_k$$
 - `original_route.csv`、`original_grid_route.csv`：当前 joint_time 使用的 A* 初值及搜索路线。
 - `summary.json`、`audit.json`：规划计算和独立审核。
 
-保存的历史飞行文件位于 `reports/revised_route_comparison/joint_time_rerecord_20261012/`：`joint_time.csv` 保存 12246 个实际采样；`joint_time.json` 保存该实验的配置、飞行时间和逐帧时间；`joint_time_reference.json` 保存参考轨迹；`audit.json` 保存独立审核结果。
+当前完整飞行文件位于 `reports/revised_route_comparison/joint_time_scaled_shared_limits_20261012/`：`joint_time.csv` 保存 12425 个实际采样；`joint_time.json` 保存时间倍率、共用运动限制和实测结果；`joint_time_reference.json` 保存规划参考轨迹；`audit.json` 保存独立重算的运动峰值、障碍间距和任务点距离。
 
 | 测量项目 | 数值 |
 |---|---:|
 | 规划路线长度 | 115.537119 米 |
 | 优化参考时间 | 62.866125 秒 |
-| 当前飞行参考时间 | 62.866125 秒 |
-| 历史保存的 AirSim 飞行时间 | 113.165414 秒 |
-| 实际最大速度 | 1.142756 m/s |
-| 实际最大加速度 | 0.458926 m/s² |
-| 实际最大 jerk | 0.893702 m/s³ |
-| 实际最小障碍间距 | 0.840439 米 |
-| 终点位置误差 | 0.005718 米 |
+| 当前飞行参考时间 | 113.159025 秒 |
+| 当前 AirSim 飞行时间 | 113.159414 秒 |
+| 实际最大速度 | 1.133225 m/s |
+| 实际最大加速度 | 0.399315 m/s² |
+| 实际最大 jerk | 1.171978 m/s³ |
+| 实际最小障碍间距 | 0.844797 米 |
+| 终点位置误差 | 0.005569 米 |
 
-历史保存的实际采样间隔为 0.006000128～0.012000256 秒，上表的实测运动数值来自该历史实验。障碍采用覆盖飞行高度的圆柱模型，场景实体碰撞另外监测。
+当前实际采样间隔为 0.009000192～0.012000256 秒，上表数值来自本次完整 AirSim 飞行。障碍采用覆盖飞行高度的圆柱模型，场景实体碰撞另外监测。本次验证使用 `--no-video`，没有生成新录像。
 
-## 当前原始时间参考的验证状态
+## 当前配置的验证状态
 
-时间读取测试使用已知匀速 Bernstein 曲线，验证默认时长、位置、速度及终点状态，确认默认参考与原始规划时间一致。
+时间读取测试使用已知匀速曲线和三次运动曲线，验证时长、位置、速度、加速度、jerk 与终点状态。时间乘以 1.8 后，速度、加速度和 jerk 分别除以 1.8、1.8² 和 1.8³。
 
-当前场景在原始时间参考下的 AirSim 验证于 3.408072704 秒出现 MPC `infeasible`，全程飞行验证尚未通过。对应验证状态保存于 `reports/revised_route_comparison/unscaled_validation.json`。飞行入口在求解失败时终止执行。当前保存的完整实测样本属于其 JSON 标明配置的历史实验。
+当前 MPC 和实际遥测审核共用场景中的三项运动上限。保存状态的 MPC 求解测试和连续预测运动约束测试通过。默认 1.8 倍时间配置完成一组完整 AirSim 飞行，全部 12425 个记录采样通过 2 m/s、1 m/s²、4 m/s³ 审核，最小障碍间距为 0.844797 米。全部任务点最小采样距离小于 0.2 米，终点距离为 0.005569 米，飞行期间没有检测到新的场景碰撞。
 
 ## 安装依赖
 
@@ -132,7 +129,7 @@ Start-Process -FilePath '.\Africa\WindowsNoEditor\Africa_001.exe' -ArgumentList 
 场景启动完成后执行一组 joint_time 飞行，录像同时包含 AirSim camera 0 和现有地面站实时二维地图：
 
 ```powershell
-.\code\flight\.venv\Scripts\python.exe code/evaluation/airsim_limited_flight.py --method joint_time --command-jerk 0.8 --output-dir reports/revised_route_comparison/new_joint_time_run
+.\code\flight\.venv\Scripts\python.exe code/evaluation/airsim_limited_flight.py --method joint_time --scale 1.8 --output-dir reports/revised_route_comparison/new_joint_time_run
 .\code\flight\.venv\Scripts\python.exe code/evaluation/audit_joint_recording.py reports/revised_route_comparison/new_joint_time_run
 ```
 

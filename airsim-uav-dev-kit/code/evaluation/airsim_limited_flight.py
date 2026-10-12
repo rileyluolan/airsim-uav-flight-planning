@@ -52,7 +52,7 @@ def settle(client):
     client.simPause(True)
 
 
-def references(name):
+def references(name, scale):
     if name == "joint_time":
         data = json.loads((SOURCE / "joint_time.json").read_text(encoding="utf-8"))
     else:
@@ -62,17 +62,19 @@ def references(name):
                                       waypoint_knots(route, waypoints), TrajectoryLimits(max_acceleration=1, max_jerk=4))
         data = trajectory.to_dict()
     save_json(OUTPUT / (name + "_reference.json"), data)
-    return Reference(data)
+    return Reference(data, scale=scale)
 
 
 def flight(client, name, args, scene):
-    reference = references(name)
+    reference = references(name, args.scale)
     route = load_route(name)
     prepare(client, scene["start"])
     settle(client)
-    options = TrackingOptions(dt=0.05, horizon=25, max_speed=2, max_acceleration=1,
-                              max_jerk=args.command_jerk, acceleration_reserve=0.3,
-                              speed_reserve=0.15, clearance=0.85, reference_clearance=0.8, initial_clearance=0.8)
+    limits = scene["limits"]
+    motion_caps = np.array([limits["speed"], limits["acceleration"], limits["jerk"]])
+    options = TrackingOptions(dt=0.05, horizon=25, max_speed=limits["speed"],
+                              max_acceleration=limits["acceleration"], max_jerk=limits["jerk"],
+                              clearance=0.85, reference_clearance=0.8, initial_clearance=0.8)
     tracker = JerkTracker("mpc", [Obstacle(**o) for o in scene["obstacles"]], options)
     state = client.getMultirotorState()
     begin_timestamp = state.timestamp
@@ -104,7 +106,7 @@ def flight(client, name, args, scene):
                     raise RuntimeError("受限飞行遥测包含无效数值。")
                 writer.writerow(row)
                 rows.append(row)
-                if np.any(values > [2 + 1e-5, 1 + 1e-5, 4 + 1e-5]):
+                if np.any(values > motion_caps + 1e-5):
                     file.flush()
                     raise RuntimeError("实测运动限制审核失败：" + str(values.tolist()))
                 gap_now = min(np.linalg.norm(position[:2] - [o["x"], o["y"]]) - o["r"] for o in scene["obstacles"])
@@ -147,7 +149,7 @@ def flight(client, name, args, scene):
     data = np.asarray(rows)
     gap = min(float(np.linalg.norm(data[:, 3:5] - [o["x"], o["y"]], axis=1).min()) - o["r"] for o in scene["obstacles"])
     result = {"method": name, "sim_duration_s": float(data[-1, 0]), "wall_duration_s": float(data[-1, 1]),
-              "reference_duration_s": reference.duration, "command_jerk_cap": args.command_jerk,
+              "reference_duration_s": reference.duration, "scale": args.scale, "motion_limits": limits,
               "controller_clearance_m": options.clearance,
               "sampled_max_speed_m_s": float(np.linalg.norm(data[:, 6:9], axis=1).max()),
               "sampled_max_acceleration_m_s2": float(np.linalg.norm(data[:, 9:12], axis=1).max()),
@@ -166,12 +168,12 @@ def main():
     global OUTPUT
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", choices=("all", "original", "joint_time"), default="all")
-    parser.add_argument("--command-jerk", type=float, default=0.8)
+    parser.add_argument("--scale", type=float, default=1.8)
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT)
     args = parser.parse_args()
-    if not math.isfinite(args.command_jerk) or not 0 < args.command_jerk <= 4:
-        raise ValueError("jerk 上限无效。")
+    if not math.isfinite(args.scale) or args.scale < 1:
+        raise ValueError("参考时间倍率必须为至少 1 的有限数值。")
     OUTPUT = args.output_dir.resolve()
     OUTPUT.mkdir(parents=True, exist_ok=True)
     scene = json.loads((SOURCE / "scenario.json").read_text(encoding="utf-8"))

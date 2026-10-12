@@ -1,0 +1,23 @@
+{
+  "method": "joint_time",
+  "sim_duration_s": 113.159414016,
+  "wall_duration_s": 173.4252204000004,
+  "reference_duration_s": 113.15902453704089,
+  "scale": 1.8,
+  "motion_limits": {
+    "speed": 2,
+    "acceleration": 1,
+    "jerk": 4
+  },
+  "controller_clearance_m": 0.85,
+  "sampled_max_speed_m_s": 1.1332254951772274,
+  "sampled_max_acceleration_m_s2": 0.3993147063110895,
+  "sampled_max_jerk_m_s3": 1.1719780720934432,
+  "sampled_min_obstacle_gap_m": 0.8447970689533566,
+  "motion_passed": true,
+  "sampled_clearance_passed": true,
+  "samples": 12425,
+  "end_error_m": 0.005569310890597438,
+  "video_frames": 0,
+  "video_times_s": []
+}

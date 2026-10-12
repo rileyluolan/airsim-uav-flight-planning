@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 logs/
 *.zip
+.cache/
+.venv/
+*.mp4

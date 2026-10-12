@@ -1,0 +1,11 @@
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "ViewMode": "SpringArmChase",
+  "ClockSpeed": 1,
+  "CameraDefaults": {
+    "CaptureSettings": [
+      {"ImageType": 0, "Width": 640, "Height": 360, "FOV_Degrees": 90}
+    ]
+  }
+}

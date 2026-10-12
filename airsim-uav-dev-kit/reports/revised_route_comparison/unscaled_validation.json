@@ -1,0 +1,18 @@
+{
+  "date": "2026-10-12",
+  "timezone": "Asia/Shanghai",
+  "method": "joint_time",
+  "reference_duration_s": 62.866124742800494,
+  "reference_timing": "original_planned_durations",
+  "full_flight_passed": false,
+  "status": "mpc_infeasible",
+  "last_sample_time_s": 3.408072704,
+  "command_jerk_cap": 0.8,
+  "model_speed_cap_m_s": 1.85,
+  "model_acceleration_cap_m_s2": 0.7,
+  "sampled_limits": {
+    "speed_m_s": 2,
+    "acceleration_m_s2": 1,
+    "jerk_m_s3": 4
+  }
+}

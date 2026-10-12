@@ -1,24 +1,8 @@
-# -*- coding: utf-8 -*-
-"""航线规划与偏差评估 —— 功能二「航线规划与自主巡航」规划层。
-
-这一层只做几何计算，**完全不依赖 airsim**，因此可以脱离仿真器单独跑：
-文件末尾的 __main__ 自带一个自检，不用开 Africa_001.exe 也能验证算法。
-
-主要内容
-    Obstacle                    圆形障碍物（XY 平面上的圆柱体）
-    Waypoint                    航点：位置 + 巡航速度 + 到点悬停秒数
-    segment_clear()             线段是否避开所有障碍
-    simplify_path()             拉直冗余折点（只删中间点，不删航点）
-    GridPlanner.plan()          在可达空间里用 A* 生成航点序列
-    plan_route()                把「起点 + 手画航点」整条路由规划出来
-    deviation_to_path()         当前位置到规划航线的横向偏差与进度
-
-坐标系：NED，X 正北、Y 正东，单位米，z 为负表示离地高度。
-规划只在 XY 平面内进行，高度按每段航线的弧长线性插值，巡航时不再单独控高。
-"""
-
 import heapq
 import math
+
+from planner.smooth_trajectory import (PlanningError, TrajectoryLimits,
+                                       generate_trajectory)
 
 # 到点判定容差（米），与 drone_base.py 的 POSITION_EPS 保持一致
 POSITION_EPS = 0.5
@@ -38,6 +22,8 @@ class Obstacle:
         self.y = float(y)
         self.r = float(r)
         self.name = name
+        if not all(math.isfinite(v) for v in (self.x, self.y, self.r)) or self.r <= 0:
+            raise ValueError("障碍坐标必须有限，半径必须为正数。")
 
     def contains(self, px, py):
         """点 (px, py) 是否落在障碍物内部。"""
@@ -63,12 +49,16 @@ class Waypoint:
 
     __slots__ = ("x", "y", "z", "speed", "hold")
 
-    def __init__(self, x, y, z=-5.0, speed=2.0, hold=0.0):
+    def __init__(self, x, y, z=-5.0, speed=3.0, hold=0.0):
         self.x = float(x)
         self.y = float(y)
         self.z = float(z)          # NED，负值表示离地高度
         self.speed = float(speed)
         self.hold = float(hold)
+        if not all(math.isfinite(v) for v in (self.x, self.y, self.z,
+                                               self.speed, self.hold)) \
+                or self.speed <= 0 or self.hold < 0:
+            raise ValueError("航点必须具有有限坐标、正速度与非负悬停时间。")
 
     @property
     def altitude(self):
@@ -81,7 +71,7 @@ class Waypoint:
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["x"], d["y"], d["z"], d.get("speed", 2.0), d.get("hold", 0.0))
+        return cls(d["x"], d["y"], d["z"], d.get("speed", 3.0), d.get("hold", 0.0))
 
     def __repr__(self):
         return "Waypoint(%.1f, %.1f, z=%.1f)" % (self.x, self.y, self.z)
@@ -225,16 +215,29 @@ class GridPlanner:
         self.resolution = float(resolution)
         self.clearance = float(clearance)
         self.max_cells = int(max_cells)
+        if not math.isfinite(self.resolution) or self.resolution <= 0 \
+                or not math.isfinite(self.clearance) or self.clearance < 0 \
+                or self.max_cells < 4:
+            raise ValueError("栅格参数无效。")
+        self.last_dense = []
 
     def plan(self, start, goal, obstacles):
         """返回 [(x, y), ...]，首尾是精确的 start / goal；搜不到返回 None。"""
         start = (float(start[0]), float(start[1]))
         goal = (float(goal[0]), float(goal[1]))
+        self.last_dense = []
+        if not all(math.isfinite(v) for v in (*start, *goal)):
+            raise ValueError("规划端点坐标必须有限。")
+        if point_blocked(*start, obstacles, self.clearance) \
+                or point_blocked(*goal, obstacles, self.clearance):
+            return None
 
         if not obstacles:
+            self.last_dense = [start, goal]
             return [start, goal]
         if not point_blocked(*start, obstacles, self.clearance) and \
                 segment_clear(start, goal, obstacles, self.clearance):
+            self.last_dense = [start, goal]
             return [start, goal]        # 直线就通，不必搜索
 
         grid = self._build_grid(start, goal, obstacles)
@@ -244,18 +247,24 @@ class GridPlanner:
 
         si, sj = self._cell(start, x0, y0, res)
         gi, gj = self._cell(goal, x0, y0, res)
-        si, sj = self._nearest_free(si, sj, nx, ny, blocked)
-        gi, gj = self._nearest_free(gi, gj, nx, ny, blocked)
+        start_clear = lambda i, j: segment_clear(
+            start, (x0 + i * res, y0 + j * res), obstacles, self.clearance)
+        goal_clear = lambda i, j: segment_clear(
+            goal, (x0 + i * res, y0 + j * res), obstacles, self.clearance)
+        si, sj = self._nearest_free(si, sj, nx, ny, blocked, start_clear)
+        gi, gj = self._nearest_free(gi, gj, nx, ny, blocked, goal_clear)
         if si is None or gi is None:
             return None
 
-        cells = self._astar(si, sj, gi, gj, nx, ny, blocked, res)
+        cells = self._astar(si, sj, gi, gj, nx, ny, blocked, res,
+                            x0, y0, obstacles)
         if cells is None:
             return None
 
         pts = [(x0 + i * res, y0 + j * res) for (i, j) in cells]
-        pts[0] = start                 # 用精确端点替换格心，避免起点被挪走
-        pts[-1] = goal
+        pts = [start] + pts + [goal]
+        pts = [p for i, p in enumerate(pts) if i == 0 or p != pts[i - 1]]
+        self.last_dense = pts
         return simplify_path(pts, obstacles, self.clearance)
 
     # -- 内部实现 -----------------------------------------------------------
@@ -270,11 +279,8 @@ class GridPlanner:
 
         nx = int((x1 - x0) / res) + 1
         ny = int((y1 - y0) / res) + 1
-        # 区域太大就自动放粗格子，宁可航线糙一点也不能把界面卡死
-        while nx * ny > self.max_cells:
-            res *= 1.5
-            nx = int((x1 - x0) / res) + 1
-            ny = int((y1 - y0) / res) + 1
+        if nx * ny > self.max_cells:
+            raise PlanningError("搜索区域超过栅格数量限制，请调整分辨率或任务范围。")
         if nx < 2 or ny < 2:
             return None
 
@@ -292,26 +298,28 @@ class GridPlanner:
         return int(round((p[0] - x0) / res)), int(round((p[1] - y0) / res))
 
     @staticmethod
-    def _nearest_free(i, j, nx, ny, blocked):
-        """起点/终点恰好落在障碍物里时，螺旋向外找最近的自由格。"""
+    def _nearest_free(i, j, nx, ny, blocked, connected):
+        """查找能够安全连接精确端点的自由格。"""
         i = max(0, min(nx - 1, i))
         j = max(0, min(ny - 1, j))
-        if not blocked[i * ny + j]:
+        if not blocked[i * ny + j] and connected(i, j):
             return i, j
         for radius in range(1, 60):
             for di in range(-radius, radius + 1):
                 for dj in (-radius, radius):
                     ni, nj = i + di, j + dj
-                    if 0 <= ni < nx and 0 <= nj < ny and not blocked[ni * ny + nj]:
+                    if 0 <= ni < nx and 0 <= nj < ny \
+                            and not blocked[ni * ny + nj] and connected(ni, nj):
                         return ni, nj
             for dj in range(-radius + 1, radius):
                 for di in (-radius, radius):
                     ni, nj = i + di, j + dj
-                    if 0 <= ni < nx and 0 <= nj < ny and not blocked[ni * ny + nj]:
+                    if 0 <= ni < nx and 0 <= nj < ny \
+                            and not blocked[ni * ny + nj] and connected(ni, nj):
                         return ni, nj
         return None, None
 
-    def _astar(self, si, sj, gi, gj, nx, ny, blocked, res):
+    def _astar(self, si, sj, gi, gj, nx, ny, blocked, res, x0, y0, obstacles):
         """8 邻域 A*，禁止穿角（斜着走时两个正交格必须都通）。"""
         SQRT2 = math.sqrt(2.0)
         moves = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
@@ -321,7 +329,7 @@ class GridPlanner:
         goal_key = gi * ny + gj
         g_score = {start_key: 0.0}
         came = {}
-        open_heap = [(self._h(si, sj, gi, gj), 0.0, start_key)]
+        open_heap = [(res * self._h(si, sj, gi, gj), 0.0, start_key)]
         closed = set()
 
         while open_heap:
@@ -340,6 +348,10 @@ class GridPlanner:
                 nkey = ni * ny + nj
                 if blocked[nkey] or nkey in closed:
                     continue
+                if not segment_clear((x0 + i * res, y0 + j * res),
+                                     (x0 + ni * res, y0 + nj * res),
+                                     obstacles, self.clearance):
+                    continue
                 if di != 0 and dj != 0:            # 不允许贴着障碍角斜穿
                     if blocked[i * ny + (j + dj)] or blocked[(i + di) * ny + j]:
                         continue
@@ -347,7 +359,8 @@ class GridPlanner:
                 if ng < g_score.get(nkey, float("inf")):
                     g_score[nkey] = ng
                     came[nkey] = key
-                    heapq.heappush(open_heap, (ng + self._h(ni, nj, gi, gj), ng, nkey))
+                    heapq.heappush(open_heap,
+                                   (ng + res * self._h(ni, nj, gi, gj), ng, nkey))
         return None
 
     @staticmethod
@@ -370,7 +383,8 @@ class GridPlanner:
 # 整条航线的规划
 # ---------------------------------------------------------------------------
 
-def plan_route(start_xyz, waypoints, obstacles, resolution=1.0, clearance=0.8):
+def plan_route(start_xyz, waypoints, obstacles, resolution=1.0, clearance=0.8,
+               method="joint_time", limits=None, progress=None):
     """把「当前起点 + 手画的一串航点」规划成一条可飞的航线。
 
     参数
@@ -381,12 +395,19 @@ def plan_route(start_xyz, waypoints, obstacles, resolution=1.0, clearance=0.8):
         clearance   与障碍物保持的安全间距（米）
 
     返回
-        route       可直接喂给 moveOnPathAsync 的稀疏路径 [(x, y, z), ...]
+        route       曲线采样路径 [(x, y, z), ...]
         dense       未拉直的 A* 原始路径 [(x, y), ...]，画在地图上对比用
         info        {"length": 米, "legs": [每段长度, ...], "warnings": [...]}
     """
     planner = GridPlanner(resolution=resolution, clearance=clearance)
-    warnings = []
+    if method not in ("minimum_snap", "polyline", "cruise_stop", "time_search", "time_search_ramps", "minimum_time", "length_optimization", "minimum_length", "joint_time"):
+        raise ValueError("未知轨迹生成方法：%s。" % method)
+    if len(start_xyz) != 3 or not all(math.isfinite(v) for v in start_xyz):
+        raise ValueError("起点必须为有限三维坐标。")
+    if point_blocked(start_xyz[0], start_xyz[1], obstacles, clearance):
+        raise PlanningError("起点违反障碍安全间距。")
+    limits = limits or TrajectoryLimits()
+    limits.validate()
 
     nodes = [(start_xyz[0], start_xyz[1], start_xyz[2])]
     nodes += [(w.x, w.y, w.z) for w in waypoints]
@@ -394,27 +415,79 @@ def plan_route(start_xyz, waypoints, obstacles, resolution=1.0, clearance=0.8):
     dense = [(nodes[0][0], nodes[0][1])]
     route = [nodes[0]]
     legs = []
+    speeds = []
+    holds = {}
+    waypoint_knots = []
+    if progress is not None:
+        progress("正在搜索满足障碍安全间距的路径。")
 
     for idx, (a, b) in enumerate(zip(nodes, nodes[1:])):
         leg_xy = planner.plan((a[0], a[1]), (b[0], b[1]), obstacles)
         if leg_xy is None:
-            warnings.append("第 %d 段无法规划无碰撞航线，已回退为直线，请检查障碍物布置。"
-                            % (idx + 1))
-            leg_xy = [(a[0], a[1]), (b[0], b[1])]
-        else:
-            leg_xy = simplify_path(leg_xy, obstacles, clearance)
+            raise PlanningError("第 %d 段无法规划满足安全间距的航线。" % (idx + 1))
 
-        dense.extend(leg_xy[1:])
+        dense.extend(planner.last_dense[1:])
         leg3d = _lift(leg_xy, a[2], b[2])
-        route.extend(leg3d[1:])            # 跳过重复的段首点
+        for point in leg3d[1:]:
+            if point != route[-1]:
+                route.append(point)
+                speeds.append(waypoints[idx].speed)
+        waypoint_knots.append(len(route) - 1)
+        if waypoints[idx].hold > 0:
+            index = len(route) - 1
+            holds[index] = holds.get(index, 0.0) + waypoints[idx].hold
         legs.append(path_length(leg3d))
 
     info = {
         "length": path_length(route),
         "legs": legs,
-        "warnings": warnings,
+        "warnings": [],
         "plan_length": path_length(dense),
+        "resolution": resolution,
+        "clearance": clearance,
     }
+    if method != "polyline":
+        if progress is not None:
+            progress("路径搜索完成，正在生成飞行轨迹。")
+        if method == "joint_time" and len(route) > 1:
+            from planner.joint_trajectory import generate_joint_route
+
+            trajectory = generate_joint_route(route, speeds, obstacles, clearance,
+                holds, waypoint_knots, limits, resolution, progress=progress)
+        else:
+            trajectory = generate_trajectory(route, speeds, obstacles, clearance,
+                holds, waypoint_knots, limits,
+                method="minimum_snap" if method == "joint_time" else method)
+        waypoint_knots = trajectory.knot_waypoints
+        if progress is not None:
+            progress("轨迹求解完成，正在检查并生成航线数据。")
+        info["polyline_length"] = info["length"]
+        info["trajectory"] = trajectory.to_dict()
+        events = []
+        hold_offsets = {}
+        for waypoint, knot in zip(waypoints, waypoint_knots):
+            arrival = trajectory.arrivals[knot] + hold_offsets.get(knot, 0.0)
+            events.append({"position": [waypoint.x, waypoint.y, waypoint.z],
+                           "knot": knot, "arrival": arrival,
+                           "departure": arrival + waypoint.hold,
+                           "hold": waypoint.hold, "speed_limit": waypoint.speed})
+            if len(trajectory.durations):
+                velocity = trajectory.evaluate(arrival, 1)
+                events[-1].update(velocity=velocity.tolist(), speed=math.sqrt(sum(float(v) ** 2 for v in velocity)))
+            hold_offsets[knot] = hold_offsets.get(knot, 0.0) + waypoint.hold
+        info["trajectory"]["waypoint_events"] = events
+        info["length"] = info["trajectory"]["metrics"]["length"]
+        info["duration"] = trajectory.duration
+        route = trajectory.geometric_route()
+        segment_lengths = trajectory.segment_lengths()
+        info["legs"] = [float(sum(segment_lengths[first:last]))
+                        for first, last in zip([0] + waypoint_knots[:-1], waypoint_knots)]
+        if not all(segment_clear(a, b, obstacles, clearance - 1e-6)
+                   for a, b in zip(route, route[1:])):
+            raise PlanningError("曲线采样路径违反障碍安全间距。")
+    if method == "polyline" and progress is not None:
+        progress("路径搜索和安全路径简化完成。")
+    info["method"] = method
     return route, dense, info
 
 
@@ -430,13 +503,13 @@ def _lift(leg_xy, z0, z1):
         dists.append(total)
 
     out = []
-    for (x, y), d in zip(leg_xy, dists):
-        f = (d / total) if total > 1e-9 else 0.0
+    for index, ((x, y), d) in enumerate(zip(leg_xy, dists)):
+        f = (d / total) if total > 1e-9 else index / max(1, len(leg_xy) - 1)
         out.append((x, y, z0 + (z1 - z0) * f))
     return out
 
 
-def demo_waypoints(height=5.0, speed=2.0):
+def demo_waypoints(height=5.0, speed=3.0):
     """一键生成的示范航线：绕场一圈，最后回到起点悬停，用于现场演示。"""
     return [
         Waypoint(10.0, -10.0, -height, speed),

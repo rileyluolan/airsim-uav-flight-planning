@@ -1,0 +1,13 @@
+numpy==1.26.4
+scipy==1.15.3
+cvxpy==1.6.7
+clarabel==0.11.1
+casadi==3.7.2
+matplotlib==3.9.4
+pillow==11.1.0
+msgpack-rpc-python==0.4.1
+opencv-contrib-python==4.11.0.86
+keyboard==0.13.5
+pywin32==312
+wheel==0.48.0
+setuptools==65.5.0

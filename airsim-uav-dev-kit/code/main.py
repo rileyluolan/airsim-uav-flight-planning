@@ -14,7 +14,7 @@
 界面左边是地图，右边分四个区：航点表 / 规划参数 / 手动操控 / 执行按钮。
 底部状态栏一直在刷位置、高度、速度和到规划航线的横向偏差。
 
-运行前提：先双击 Africa_001.exe 把场景加载完，再启动本程序并点「连接」。
+运行前提：先运行 start_simulator_with_camera.bat 把场景加载完，再启动本程序并点「连接」。
 没有装 airsim 也能打开——只做离线规划，飞行相关的按钮会自动禁用。
 
 坐标系：NED，X 正北、Y 正东、Z 向下为正；界面上「高度」一律显示正值。
@@ -68,7 +68,11 @@ FONT_L  = ("Microsoft YaHei UI", 11, "bold")
 FONT_XL = ("Consolas", 20, "bold")
 
 DEFAULT_ALT = 5.0        # 默认巡航高度（离地，米）
-DEFAULT_SPD = 2.0        # 默认巡航速度（米每秒）
+DEFAULT_SPD = 3.0        # 默认巡航速度（米每秒）
+PLANNING_METHODS = {
+    "八邻域 A* + 安全路径简化": "polyline",
+    "联合轨迹优化（IPOPT）": "joint_time",
+}
 POSITION_EPS = 0.6       # 到点判定容差（米）
 DEV_WARN = 3.0           # 手动模式偏差告警阈值（米）
 
@@ -222,13 +226,29 @@ class GCSApp:
         self.armed = False
         self.flying = False
         self.mode = "未连接"
-        self.waypoints = []          # [Waypoint, ...]
-        self.obstacles = []          # [Obstacle, ...]
-        self.route = []              # 规划后的稀疏航线 [(x, y, z), ...]
+        self.waypoints = [
+            Waypoint(25.8, -17.7, -DEFAULT_ALT, DEFAULT_SPD),
+            Waypoint(12.1, -0.5, -DEFAULT_ALT, DEFAULT_SPD),
+            Waypoint(21.9, 4.0, -DEFAULT_ALT, DEFAULT_SPD),
+            Waypoint(32.9, 8.1, -DEFAULT_ALT, DEFAULT_SPD),
+            Waypoint(21.8, 4.0, -DEFAULT_ALT, DEFAULT_SPD),
+            Waypoint(0.0, 0.0, -DEFAULT_ALT, DEFAULT_SPD),
+        ]
+        self.obstacles = [
+            Obstacle(17.8, -12.9, 4.1),
+            Obstacle(27.6, 6.3, 3.0),
+            Obstacle(17.2, 1.8, 3.0),
+            Obstacle(8.3, 10.1, 3.0),
+        ]
+        self.route = []              # 规划曲线的空间采样点 [(x, y, z), ...]
         self.route_xy = []           # 同上，只留 XY，算偏差用
         self.route_cum = []
         self.route_dense = []        # A* 原始路径，画在地图上对比
         self.info = {}
+        self._planned_task = None
+        self._planning_requested = False
+        self._planning_started = None
+        self._planning_stage = ""
         self.home = None             # 起飞点 NED
         self.cruise_index = -1       # 当前正在飞的航点序号
         self.telem = {}
@@ -262,6 +282,9 @@ class GCSApp:
 
         self._build_style()
         self._build_ui()
+        self._refresh_wp_tree()
+        self._refresh_obs_tree()
+        self.root.after_idle(self.fit_view)
 
         self._runner = threading.Thread(target=self._runner_loop, daemon=True)
         self._runner.start()
@@ -277,7 +300,7 @@ class GCSApp:
             self._log("   安装：pip install airsim==1.8.1（需 Python 3.10）")
             self._set_mode("仅规划")
         else:
-            self._log("请先启动 Africa_001.exe，待场景加载完再点「连接」。")
+            self._log("请先运行 start_simulator_with_camera.bat，待场景加载完再点「连接」。")
 
     # =======================================================================
     # 界面搭建
@@ -529,6 +552,13 @@ class GCSApp:
         self._label(par, "安全间距 m", MUTED, FONT_S).grid(row=0, column=1, sticky="w")
         self.var_clr = tk.StringVar(value="0.8")
         self._entry_var(par, self.var_clr, 5).grid(row=1, column=1)
+
+        self._label(f, "规划算法", MUTED, FONT_S).pack(anchor="w", padx=8)
+        self.var_method = tk.StringVar(value=next(iter(PLANNING_METHODS)))
+        self.cmb_method = ttk.Combobox(
+            f, textvariable=self.var_method, values=list(PLANNING_METHODS),
+            state="readonly", width=32)
+        self.cmb_method.pack(fill="x", padx=8, pady=(2, 6))
 
         pb = tk.Frame(f, bg=PANEL)
         pb.pack(fill="x", padx=6, pady=(4, 6))
@@ -805,7 +835,7 @@ class GCSApp:
     def _require_conn(self):
         if not self.connected:
             messagebox.showwarning("未连接", "请先点「连接」连上 AirSim 仿真器。\n\n"
-                                             "确认已经双击启动 Africa_001.exe 并且场景加载完毕。")
+                                             "确认已经运行 start_simulator_with_camera.bat 并且场景加载完毕。")
             return False
         return True
 
@@ -935,9 +965,8 @@ class GCSApp:
 
     def load_demo(self):
         self.waypoints = demo_waypoints()
-        if not self.obstacles:
-            self.obstacles = demo_obstacles()
-            self._refresh_obs_tree()
+        self.obstacles = demo_obstacles()
+        self._refresh_obs_tree()
         self._refresh_wp_tree()
         self.fit_view()
         self._log("已载入示范航线（5 个航点 + 2 个障碍物），可直接按「规划航线」。", "hi")
@@ -948,11 +977,21 @@ class GCSApp:
             filetypes=[("航线文件", "*.json")], initialfile="route.json")
         if not path:
             return
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(self._route_data(), fh, ensure_ascii=False, indent=2)
+        self._log("航线已保存 -> %s" % os.path.basename(path), "ok")
+
+    def _route_data(self):
         data = {"waypoints": [w.to_dict() for w in self.waypoints],
                 "obstacles": [o.to_dict() for o in self.obstacles]}
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-        self._log("航线已保存 -> %s" % os.path.basename(path), "ok")
+        if data == self._planned_task:
+            data["route"] = self.route
+            data["planning"] = {"method": self.info["method"],
+                                "resolution": self.info["resolution"],
+                                "clearance": self.info["clearance"]}
+            if "trajectory" in self.info:
+                data["trajectory"] = self.info["trajectory"]
+        return data
 
     def load_route(self):
         path = filedialog.askopenfilename(title="载入航线",
@@ -960,10 +999,7 @@ class GCSApp:
         if not path:
             return
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            self.waypoints = [Waypoint.from_dict(d) for d in data.get("waypoints", [])]
-            self.obstacles = [Obstacle.from_dict(d) for d in data.get("obstacles", [])]
+            self._load_route_file(path)
         except Exception as exc:
             messagebox.showerror("载入失败", "文件读不出来：%s" % exc)
             return
@@ -971,6 +1007,18 @@ class GCSApp:
         self._refresh_obs_tree()
         self.fit_view()
         self._log("已载入航线：%d 航点 / %d 障碍。" % (len(self.waypoints), len(self.obstacles)), "ok")
+
+    def _load_route_file(self, path):
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        planning = data.get("planning", {})
+        method = planning.get("method", "polyline")
+        label = next(label for label, value in PLANNING_METHODS.items() if value == method)
+        self.waypoints = [Waypoint.from_dict(d) for d in data.get("waypoints", [])]
+        self.obstacles = [Obstacle.from_dict(d) for d in data.get("obstacles", [])]
+        self.var_method.set(label)
+        self.var_res.set(str(planning.get("resolution", 0.5)))
+        self.var_clr.set(str(planning.get("clearance", 0.8)))
 
     # =======================================================================
     # 障碍物
@@ -1001,11 +1049,47 @@ class GCSApp:
     # =======================================================================
 
     def on_plan(self):
+        if self._planning_requested:
+            return
+        if not self.waypoints:
+            self.lbl_plan.configure(text="请添加航点后规划航线。", fg=WARN)
+            self._log("请添加航点后规划航线。", "warn")
+            return
+        self._begin_plan()
         self._submit(self._job_plan,
                      self._num(self.var_res, 0.5), self._num(self.var_clr, 0.8),
-                     self._num(self.var_alt, DEFAULT_ALT))
+                     self._num(self.var_alt, DEFAULT_ALT),
+                     PLANNING_METHODS[self.var_method.get()])
 
-    def _job_plan(self, res=0.5, clr=0.8, alt=DEFAULT_ALT):
+    def _job_plan(self, res=0.5, clr=0.8, alt=DEFAULT_ALT, method="polyline"):
+        self._planning_started = time.monotonic()
+        self._planning_stage = "正在准备规划数据"
+        self.ui_q.put(("call", self._begin_plan))
+        completed = False
+        try:
+            self._compute_plan(res, clr, alt, method)
+            completed = bool(self.route)
+        finally:
+            def finish():
+                self._planning_requested = False
+                self._planning_started = None
+                self.btn_plan.configure(text="规划航线", state="normal")
+                self.cmb_method.configure(state="readonly")
+                if not completed:
+                    self.lbl_plan.configure(text="规划未完成。请查看运行日志中的提示。", fg=DANGER)
+            self.ui_q.put(("call", finish))
+
+    def _begin_plan(self):
+        self._planning_requested = True
+        self.btn_plan.configure(text="正在规划", state="disabled")
+        self.cmb_method.configure(state="disabled")
+        self.lbl_plan.configure(text="规划任务已提交，等待执行。", fg=WARN)
+
+    def _plan_progress(self, message):
+        self._planning_stage = message
+        self._log(message)
+
+    def _compute_plan(self, res=0.5, clr=0.8, alt=DEFAULT_ALT, method="polyline"):
         if len(self.waypoints) == 0:
             self._log("还没有航点，先在地图上点几个（或按「示范航线」）。", "warn")
             return
@@ -1021,28 +1105,43 @@ class GCSApp:
             start = (0.0, 0.0, -abs(alt))
 
         t0 = time.time()
+        self.route = []
+        self.route_xy = []
+        self.route_cum = []
+        self.route_dense = []
+        self.info = {}
+        self._planned_task = None
         route, dense, info = plan_route(start, self.waypoints, self.obstacles,
-                                        resolution=max(res, 0.2), clearance=max(clr, 0.0))
+                                        resolution=max(res, 0.2), clearance=max(clr, 0.0),
+                                        method=method, progress=self._plan_progress)
         self.route = route
         self.route_xy = [(p[0], p[1]) for p in route]
         self.route_cum = cumulative_lengths(route)
         self.route_dense = dense
         self.info = info
+        self._planned_task = {"waypoints": [w.to_dict() for w in self.waypoints],
+                              "obstacles": [o.to_dict() for o in self.obstacles]}
 
-        msg = ("规划完成：%.1f 米 / %d 个折点（障碍 %d 个，耗时 %.2f 秒）"
-               % (info["length"], len(route), len(self.obstacles), time.time() - t0))
+        method_label = next(label for label, value in PLANNING_METHODS.items() if value == method)
+        point_label = "折点" if method == "polyline" else "轨迹采样点"
+        duration_text = ("，规划飞行时间 %.2f 秒" % info["duration"]
+                         if method != "polyline" else "")
+        msg = ("规划完成：%.1f 米 / %d 个%s%s（障碍 %d 个，规划耗时 %.2f 秒）"
+               % (info["length"], len(route), point_label, duration_text,
+                  len(self.obstacles), time.time() - t0))
         self._log(msg, "ok")
         for w in info["warnings"]:
             self._log(w, "warn")
 
         def upd():
             self.lbl_plan.configure(
-                text=("航线总长 %.1f 米，共 %d 个折点。\n"
+                text=("航线总长 %.1f 米，共 %d 个%s%s。\n"
                       "各段长度：%s\n"
-                      "A* 原始路径 %d 点，拉直后 %d 点。"
-                      % (info["length"], len(route),
+                      "A* 搜索路径 %d 点。\n"
+                      "规划算法：%s。"
+                      % (info["length"], len(route), point_label, duration_text,
                          " / ".join("%.1f" % L for L in info["legs"]),
-                         len(dense), len(route))),
+                         len(dense), method_label)),
                 fg=OK)
         self.ui_q.put(("call", upd))
 
@@ -1106,15 +1205,16 @@ class GCSApp:
                      self.var_use_path.get(),
                      self._num(self.var_alt, DEFAULT_ALT),
                      self._num(self.var_res, 0.5),
-                     self._num(self.var_clr, 0.8))
+                     self._num(self.var_clr, 0.8),
+                     PLANNING_METHODS[self.var_method.get()])
 
     def _job_cruise(self, speed=DEFAULT_SPD, use_path=False,
-                    alt=DEFAULT_ALT, res=0.5, clr=0.8):
+                    alt=DEFAULT_ALT, res=0.5, clr=0.8, method="polyline"):
         if not self.flying:
             self._job_takeoff(alt)
-        if not self.route:
-            self._log("还没规划航线，先自动规划一次。")
-            self._job_plan(res, clr, alt)
+        if not self.route or self.info.get("method") != method:
+            self._log("正在使用所选算法规划巡航航线。")
+            self._job_plan(res, clr, alt, method)
         if not self.route:
             self._log("航线规划失败，巡航中止。", "err")
             return
@@ -1576,6 +1676,11 @@ class GCSApp:
         """界面心跳。刷新出任何异常都不能让心跳停掉——演示到一半界面卡死是最糟的。"""
         try:
             self._drain_queue()
+            if self._planning_requested and self._planning_started is not None:
+                self.lbl_plan.configure(
+                    text="%s\n已用 %.1f 秒。" % (
+                        self._planning_stage, time.monotonic() - self._planning_started),
+                    fg=WARN)
             self._update_status()
             self._redraw()
         except Exception as exc:
